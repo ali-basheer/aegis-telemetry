@@ -1,0 +1,19 @@
+﻿system:
+  name: "AEGIS_v1"
+  version: "1.0.0"
+  sampling_rate_hz: 1.0
+
+hardware:
+  simulation_mode: true
+  port: "AUTO"
+  baud_rate: 38400
+
+thresholds:
+  nox_deviation_limit: 0.25 
+  min_rpm_active: 600
+
+database:
+  path: "data/logs/forensics.db"
+  
+ai:
+  model_path: "data/models/emissions_v1.tflite"
