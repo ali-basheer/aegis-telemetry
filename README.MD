@@ -1,3 +1,4 @@
+````markdown
 # A.E.G.I.S. (Automated Emissions Governance & Intelligence System)
 
 ![Status](https://img.shields.io/badge/Status-Production_Ready-red) ![Profile](https://img.shields.io/badge/Profile-Ford_6.7L_Powerstroke-blue) ![License](https://img.shields.io/badge/License-MIT-lightgrey)
@@ -42,3 +43,39 @@ python tools/train_dummy_model.py
 # 3. Verify Physics Engine
 # Runs a virtual dyno test to ensure math is correct
 python tests/test_physics.py
+````
+
+### 3\. Go Live (Forensic Mode)
+
+Plug the adapter into the truck and the computer.
+
+**Option A: Visual Dashboard (Laptop)**
+
+```bash
+python src/main.py
+```
+
+*Displays live telemetry, fraud probability, and alerts.*
+
+**Option B: Headless Daemon (Raspberry Pi)**
+
+```bash
+python src/core/orchestrator.py
+```
+
+*Runs in the background. Logs evidence to `data/logs/forensics.db`.*
+
+-----
+
+## Configuration
+
+Edit `config/settings.yaml` to tune the detection thresholds:
+
+  * `smoke_limit_lambda`: 1.10 (Lower value = Allow more smoke before flagging)
+  * `confidence_threshold`: 0.85 (AI certainty required to flag fraud)
+
+## License
+
+MIT
+
+```
