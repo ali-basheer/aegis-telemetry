@@ -1,5 +1,4 @@
 
-````markdown
 # A.E.G.I.S. (Automated Emissions Governance & Intelligence System)
 
 ![Status](https://img.shields.io/badge/Status-Production_Ready-red) ![Profile](https://img.shields.io/badge/Profile-Ford_6.7L_Powerstroke-blue) ![License](https://img.shields.io/badge/License-MIT-lightgrey)
@@ -71,4 +70,3 @@ Edit `config/settings.yaml` to tune the detection thresholds:
 
 ## License
 MIT
-````
