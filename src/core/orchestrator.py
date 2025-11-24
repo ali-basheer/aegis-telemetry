@@ -201,5 +201,3 @@ class HeadlessOrchestrator:
         logger.info("Daemon Stopped Gracefully.")
 
 if __name__ == "__main__":
-    daemon = HeadlessOrchestrator()
-    daemon.run()
