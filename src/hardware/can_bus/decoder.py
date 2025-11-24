@@ -1,319 +1,156 @@
 ﻿"""
-MODULE: CAN_FRAME_DECODER (ISO-15765-2 / SAE J1939)
-AUTHOR: ALI BASHEER (A.E.G.I.S. LEAD)
-DATE: 2025-01-04
-CLASSIFICATION: FORENSIC / LOW-LEVEL NETWORK
+MODULE: CAN_BUS_TOPOLOGY_FORENSICS (THE GHOST HUNTER)
+PROFILE: FORD_SCORPION_V8 (HS-CAN / MS-CAN / J1939)
 
 DESCRIPTION:
-    Implements a passive packet sniffer and reassembly engine for automotive networks.
+    A passive network analyzer that maps the 'Digital Fingerprint' of the vehicle.
     
-    Standard OBD-II queries (Service $01) are active/polling and easily spoofed by 
-    defeat device firmware. This module listens to 'Broadcast Traffic' (inter-module 
-    communication) which is much harder to falsify without breaking vehicle drivability.
+    Modern "Delete Kits" and "Piggyback Tuners" often introduce anomalous 
+    nodes onto the CAN bus or silence legitimate ones (like the Reductant Control Unit).
 
-    CAPABILITIES:
-    1. ISO-TP Reassembly: Reconstructs multi-frame payloads (up to 4095 bytes).
-    2. J1939 PGN Parsing: Decodes heavy-duty diesel broadcast standards (Cummins/Detroit).
-    3. Bitwise Signal Extraction: Unpacks non-byte-aligned signals (Intel/Motorola formats).
-    4. Shadow PID Detection: Flags proprietary diagnostic commands often used to trigger 
-       'Dyno Mode' or 'EPA Mode'.
-
-STANDARDS:
-    - ISO 11898 (Physical Layer)
-    - ISO 15765-2 (Transport Layer)
-    - SAE J1939-71 (Application Layer - Vehicle)
+    This module scans for:
+    1. ZOMBIE NODES: Expected ECUs that are silent (e.g., Unplugged EGR).
+    2. GHOST NODES: Unknown CAN IDs (e.g., A 'Tuner Box' intercepting traffic).
+    3. JITTER: Timing anomalies caused by signal interception latency.
 """
 
-import struct
-import logging
 import time
-from enum import IntEnum
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+import logging
+from typing import Dict, List, Set
 
 # Configure module-level logger
-logger = logging.getLogger("AEGIS.HW.CAN")
-
-# --- PROTOCOL CONSTANTS ---
-class FrameType(IntEnum):
-    SINGLE = 0x0
-    FIRST = 0x1
-    CONSECUTIVE = 0x2
-    FLOW_CONTROL = 0x3
-
-@dataclass
-class CanFrame:
-    """
-    Represents a raw CAN 2.0B Frame.
-    """
-    arbitration_id: int
-    dlc: int
-    payload: bytes
-    timestamp: float
-
-    @property
-    def is_extended(self) -> bool:
-        return self.arbitration_id > 0x7FF
-
-@dataclass
-class PGN_Definition:
-    """
-    SAE J1939 Parameter Group Number Definition.
-    """
-    pgn: int
-    name: str
-    spns: List[Dict] # List of Signal Parameter Numbers
-
-class BitStreamWorker:
-    """
-    Utility for extracting signals from raw byte streams.
-    Handles Endianness and Bit-Shifting.
-    """
-    @staticmethod
-    def extract_signal(payload: bytes, start_bit: int, length: int, 
-                       is_little_endian: bool = False, scale: float = 1.0, 
-                       offset: float = 0.0) -> float:
-        """
-        Extracts a physical value from a packed byte array.
-        """
-        # 1. Convert bytes to a massive integer
-        raw_int = int.from_bytes(payload, byteorder='big')
-        
-        # 2. Calculate bit position (Big Endian logic default for SAE)
-        # Total bits
-        total_bits = len(payload) * 8
-        
-        # In Big Endian (Motorola), start_bit is usually MSB or LSB of the byte
-        # We simplify to a normalized 0-indexed bit stream for forensic extract
-        
-        # Create a bit mask
-        mask = (1 << length) - 1
-        
-        # Shift to align LSB
-        shift_amount = total_bits - start_bit - length
-        if shift_amount < 0:
-            # Handle split byte signals manually if needed (complexity simplification)
-            return 0.0 
-            
-        unmasked = (raw_int >> shift_amount) & mask
-        
-        # 3. Apply Physical Scaling
-        return (unmasked * scale) + offset
-
-class ISOTP_Reassembler:
-    """
-    State Machine for ISO 15765-2 Transport Layer.
-    Reassembles segmented messages (e.g., VIN, Calibration IDs, Freeze Frames).
-    """
-    
-    def __init__(self):
-        self.buffer: Dict[int, bytearray] = {} # Map ID -> Buffer
-        self.expected_len: Dict[int, int] = {}
-        self.next_seq: Dict[int, int] = {}
-        
-    def process_frame(self, frame: CanFrame) -> Optional[bytes]:
-        """
-        Returns complete payload bytes if a message is finished, else None.
-        """
-        # ISO-TP uses the first byte as the PCI (Protocol Control Information)
-        if not frame.payload: return None
-        
-        pci_byte = frame.payload[0]
-        frame_type = (pci_byte & 0xF0) >> 4
-        
-        # 1. Single Frame (SF)
-        if frame_type == FrameType.SINGLE:
-            length = pci_byte & 0x0F
-            if length == 0: # CAN FD escape
-                return None 
-            return frame.payload[1:1+length]
-            
-        # 2. First Frame (FF)
-        elif frame_type == FrameType.FIRST:
-            # Length is 12 bits: lower nibble of byte 0 + all of byte 1
-            length = ((pci_byte & 0x0F) << 8) + frame.payload[1]
-            self.expected_len[frame.arbitration_id] = length
-            self.buffer[frame.arbitration_id] = bytearray(frame.payload[2:])
-            self.next_seq[frame.arbitration_id] = 1
-            # In a real sniffer, we might see Flow Control here, but we just listen
-            return None
-            
-        # 3. Consecutive Frame (CF)
-        elif frame_type == FrameType.CONSECUTIVE:
-            seq_idx = pci_byte & 0x0F
-            arb_id = frame.arbitration_id
-            
-            if arb_id not in self.buffer:
-                # We missed the First Frame (common in passive sniffing)
-                return None 
-                
-            if seq_idx != (self.next_seq[arb_id] % 16):
-                # Sequence error (Packet loss)
-                logger.warning(f"ISO-TP Seq Error on ID {hex(arb_id)}. Dropping buffer.")
-                del self.buffer[arb_id]
-                return None
-                
-            self.buffer[arb_id].extend(frame.payload[1:])
-            self.next_seq[arb_id] += 1
-            
-            # Check if complete
-            if len(self.buffer[arb_id]) >= self.expected_len[arb_id]:
-                # Trim padding
-                payload = bytes(self.buffer[arb_id][:self.expected_len[arb_id]])
-                del self.buffer[arb_id]
-                return payload
-                
-        return None
-
-class J1939_Decoder:
-    """
-    Decodes heavy-duty diesel PGNs (Parameter Group Numbers).
-    Used for Cummins / Detroit Diesel / Caterpillar engines.
-    """
-    
-    # Common PGNs
-    PGN_EEC1 = 0xF004  # Electronic Engine Controller 1 (RPM, Torque)
-    PGN_ET1  = 0xFEEE  # Engine Temperature 1 (Coolant, Oil)
-    PGN_AMB  = 0xFEF5  # Ambient Conditions
-    PGN_AT1  = 0xF005  # Aftertreatment 1 (DEF Level, SCR Status)
-
-    @staticmethod
-    def decode(frame: CanFrame) -> Dict[str, float]:
-        """
-        Parses payload based on PGN derived from 29-bit Identifier.
-        """
-        if not frame.is_extended: return {}
-        
-        # J1939 ID Breakdown:
-        # Priority (3) | PGN (18) | Source Address (8)
-        pgn = (frame.arbitration_id >> 8) & 0x3FFFF
-        
-        signals = {}
-        
-        # 1. PGN 61444 (EEC1) - Engine RPM & Torque
-        if pgn == J1939_Decoder.PGN_EEC1:
-            # RPM: Bytes 4,5. Resolution 0.125 rpm/bit. Offset 0.
-            rpm_raw = (frame.payload[4] << 8) | frame.payload[3] # Little Endian for J1939 words
-            signals['rpm'] = rpm_raw * 0.125
-            
-            # Torque Mode: Byte 0 (bits 1-4)
-            signals['torque_mode'] = frame.payload[0] & 0x0F
-            
-        # 2. PGN 65262 (ET1) - Temps
-        elif pgn == J1939_Decoder.PGN_ET1:
-            # Coolant Temp: Byte 0. Res 1 degC/bit, Offset -40
-            signals['coolant_temp'] = (frame.payload[0] * 1.0) - 40.0
-            
-        # 3. PGN 61445 (AT1) - SCR / DEF Info
-        elif pgn == J1939_Decoder.PGN_AT1:
-            # DEF Level: Byte 0. Res 0.4 %/bit.
-            signals['def_level_pct'] = frame.payload[0] * 0.4
-            
-        return signals
+logger = logging.getLogger("AEGIS.HARDWARE.DECODER")
 
 class ProprietarySniffer:
     """
-    The Forensic Logic.
-    Detects messages that exist on the bus but are NOT standard J1939 or ISO PIDs.
-    These are candidates for 'Shadow Mode' switches.
+    Decodes low-level bus topology to find hardware tampering.
     """
     
-    # Known proprietary triggers (Fictionalized based on research)
-    SUSPICIOUS_IDS = [
-        0x123, # Generic OEM Debug
-        0x456, # Bosch EDC17 'Factory Mode' Broadcast
-        0x7E0  # Standard Request (Watch for proprietary SIDs)
-    ]
-    
+    # --- FORD 6.7L "KNOWN GOOD" TOPOLOGY (ISO 15765-4) ---
+    # The Standard ID Map for a stock 2011+ Super Duty
+    EXPECTED_NODES = {
+        0x7E8: "PCM (Powertrain Control Module)",
+        0x7E9: "TCM (Transmission Control Module)",
+        0x7EA: "GPCM (Glow Plug Control Module)", 
+        0x7EB: "DCU (Dosing Control Unit / Reductant)",
+        0x7EC: "NOx_A (Upstream Sensor)",
+        0x7ED: "NOx_B (Downstream Sensor)"
+    }
+
+    # --- J1939 "HEAVY DUTY" MAP (Packet Headers) ---
+    # Used on F-350/450/550 Chassis Cabs
+    EXPECTED_PGNS = {
+        61444: "EEC1 (Engine Speed/Torque)",
+        64984: "AT1T (Aftertreatment Gas)",
+        65262: "ET1 (Engine Temperature)",
+        64923: "AT1IC1 (Aftertreatment Injector)"
+    }
+
     def __init__(self):
-        self.iso_handler = ISOTP_Reassembler()
-        self.anomaly_log = []
+        self.seen_ids: Set[int] = set()
+        self.seen_pgns: Set[int] = set()
+        self.frame_intervals: Dict[int, List[float]] = {}
+        self.last_seen: Dict[int, float] = {}
         
-    def inspect_frame(self, arbitration_id: int, data_bytes: List[int], timestamp: float):
-        frame = CanFrame(
-            arbitration_id=arbitration_id, 
-            dlc=len(data_bytes), 
-            payload=bytes(data_bytes), 
-            timestamp=timestamp
-        )
-        
-        # 1. Run Decoders
-        j1939_data = J1939_Decoder.decode(frame)
-        if j1939_data:
-            return {"protocol": "J1939", "signals": j1939_data}
-            
-        iso_payload = self.iso_handler.process_frame(frame)
-        if iso_payload:
-            # Full diagnostic response detected
-            return self._analyze_diagnostic_payload(iso_payload)
-            
-        # 2. Proprietary ID Check
-        if frame.arbitration_id in self.SUSPICIOUS_IDS:
-            self._analyze_proprietary(frame)
-            return {"protocol": "PROPRIETARY", "alert": "Suspicious ID detected"}
-            
-        return None
-
-    def _analyze_diagnostic_payload(self, payload: bytes):
+    def ingest_frame(self, frame_id: int, protocol: str = "CAN"):
         """
-        Inspects reassembled diagnostic packets for 'Mode $27' (Security Access)
-        or proprietary routines (Mode $31).
+        Logs a raw CAN ID to the topology map.
         """
-        if len(payload) < 2: return None
+        current_t = time.time()
         
-        sid = payload[0] # Service ID
+        # 1. TRACK PRESENCE
+        self.seen_ids.add(frame_id)
         
-        # SID $27: Security Access (Unlocking ECU)
-        if sid == 0x27:
-            return {"alert": "SECURITY_ACCESS_ATTEMPT", "seed": payload.hex()}
-            
-        # SID $31: Routine Control (Running tests)
-        if sid == 0x31:
-            # Check for known 'Dyno Mode' routines
-            routine_id = (payload[1] << 8) | payload[2]
-            if routine_id == 0x0101: # Example: VW Roller Bench Mode
-                return {"alert": "DYNO_MODE_TRIGGERED", "routine": "0x0101"}
+        # 2. TRACK TIMING (Jitter Detection)
+        # Real ECUs are crystal-controlled and very precise. 
+        # Tuners (cheap microcontrollers) drift.
+        if frame_id in self.last_seen:
+            delta = current_t - self.last_seen[frame_id]
+            if frame_id not in self.frame_intervals:
+                self.frame_intervals[frame_id] = []
+            self.frame_intervals[frame_id].append(delta)
+            # Keep buffer small
+            if len(self.frame_intervals[frame_id]) > 50:
+                self.frame_intervals[frame_id].pop(0)
                 
-        return {"protocol": "ISO-14229", "sid": hex(sid), "len": len(payload)}
+        self.last_seen[frame_id] = current_t
 
-    def _analyze_proprietary(self, frame: CanFrame):
+    def generate_topology_report(self) -> Dict:
         """
-        Heuristic analysis of unknown frames.
-        Look for static flags toggling when steering angle is 0 (Test Cycle).
+        Compare seen nodes against the 'Golden Image' of a stock truck.
         """
-        # (Simplified heuristic for demo)
-        # If ID 0x456 Byte 0 flips from 0x00 to 0x01, it might be a 'Cheat Active' flag.
-        if frame.arbitration_id == 0x456:
-            flag = frame.payload[0]
-            if flag == 0x01:
-                logger.critical("Proprietary Broadcast 0x456: Flag Active (Possible Map Switch)")
+        report = {
+            "status": "CLEAN",
+            "missing_nodes": [],
+            "ghost_nodes": [],
+            "jitter_anomalies": []
+        }
+        
+        # 1. CHECK FOR MISSING HARDWARE (HARD PART DELETE)
+        # We expect the PCM and TCM to always be there.
+        # If DCU (0x7EB) is missing on a Diesel, the SCR is likely unplugged.
+        critical_nodes = [0x7E8, 0x7E9, 0x7EB]
+        
+        for node in critical_nodes:
+            if node not in self.seen_ids:
+                name = self.EXPECTED_NODES.get(node, "UNKNOWN")
+                report["missing_nodes"].append(f"{name} [ID: {hex(node)}]")
+                if node == 0x7EB:
+                    report["status"] = "HARDWARE_TAMPER (DEF_MODULE_OFFLINE)"
 
-# --- UNIT TEST HARNESS ---
+        # 2. CHECK FOR GHOST HARDWARE (TUNER BOX)
+        # Any ID in the 0x7Ex range that isn't in our map is suspicious.
+        # Tuners often occupy 0x7E7 or 0x7EF to avoid collision.
+        for seen in self.seen_ids:
+            if 0x7E0 <= seen <= 0x7EF:
+                if seen not in self.EXPECTED_NODES:
+                    report["ghost_nodes"].append(f"UNIDENTIFIED_ECU [ID: {hex(seen)}]")
+                    report["status"] = "HARDWARE_TAMPER (UNKNOWN_DEVICE_ON_BUS)"
+
+        # 3. CHECK TIMING INTEGRITY (MAN-IN-THE-MIDDLE)
+        # A "Piggyback" intercepts signals and re-transmits them.
+        # This adds latency variance (jitter).
+        # A healthy ECU has <5% variance. A Tuner often has >20%.
+        for node_id, intervals in self.frame_intervals.items():
+            if len(intervals) > 10:
+                avg = sum(intervals) / len(intervals)
+                variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
+                std_dev = variance ** 0.5
+                
+                jitter_pct = (std_dev / avg) * 100.0
+                
+                if jitter_pct > 15.0: # 15% Jitter Threshold
+                    name = self.EXPECTED_NODES.get(node_id, "UNKNOWN")
+                    report["jitter_anomalies"].append(
+                        f"{name} [ID: {hex(node_id)}] Jitter: {jitter_pct:.1f}% (Signal Injection?)"
+                    )
+                    if report["status"] == "CLEAN":
+                        report["status"] = "SIGNAL_INTEGRITY_FAIL"
+
+        return report
+
+# --- STANDALONE SCANNER MODE ---
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    print("--- AEGIS TOPOLOGY SCANNER (FORD 6.7L) ---")
     sniffer = ProprietarySniffer()
     
-    print("--- AEGIS CAN SNIFFER INITIALIZED ---")
+    # Simulate a "Delete Tuner" Scenario
+    # 1. PCM is present (0x7E8)
+    # 2. TCM is present (0x7E9)
+    # 3. DCU is MISSING (0x7EB) - User unplugged it
+    # 4. Tuner Box is injecting fake signals (0x7E5)
     
-    # 1. Simulate J1939 EEC1 Frame (RPM = 1600)
-    # 1600 / 0.125 = 12800 -> 0x3200 (Little Endian -> 00 32)
-    eec1_data = [0x00, 0xFF, 0xFF, 0x00, 0x32, 0xFF, 0xFF, 0xFF] 
-    # ID: Priority 3, PGN 61444 (F004), Source 00 -> 0CF00400
-    res = sniffer.inspect_frame(0x0CF00400, eec1_data, time.time())
-    print(f"J1939 Decode: {res}")
+    print("[SIM] Injecting Traffic...")
+    sim_traffic = [0x7E8, 0x7E9, 0x7EA, 0x7E5] # 0x7E5 is the Ghost
     
-    # 2. Simulate ISO-TP Multi-Frame Diagnostic Response
-    # Frame 1: First Frame (1), Len 0x00C (12 bytes)
-    ff_data = [0x10, 0x0C, 0x62, 0x12, 0x34, 0x56, 0x78, 0x9A]
-    res1 = sniffer.inspect_frame(0x7E8, ff_data, time.time())
+    for _ in range(100):
+        for node in sim_traffic:
+            sniffer.ingest_frame(node)
+            
+    report = sniffer.generate_topology_report()
     
-    # Frame 2: Consecutive Frame (2), Seq 1
-    cf_data = [0x21, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x00] # Padding
-    res2 = sniffer.inspect_frame(0x7E8, cf_data, time.time())
-    
-    if res2:
-        print(f"ISO-TP Reassembly: Payload={res2.get('sid')} hex")
-    
-    # 3. Simulate Proprietary Trigger
-    print("Injecting Suspicious Frame 0x456...")
-    sniffer.inspect_frame(0x456, [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], time.time())
+    print(f"\nSTATUS: {report['status']}")
+    if report['missing_nodes']:
+        print(f"MISSING: {report['missing_nodes']}")
+    if report['ghost_nodes']:
+        print(f"DETECTED: {report['ghost_nodes']}")
